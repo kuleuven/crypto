@@ -109,22 +109,34 @@ func (p *proxyConn) handleAuthMsg(msg *userAuthRequestMsg) (*userAuthRequestMsg,
 	username := msg.User
 	switch msg.Method {
 	case "publickey":
-		downStreamPublicKey, isQuery, sig, err := parsePublicKeyMsg(msg)
+		downStreamPublicKey, isQuery, payload, err := parsePublicKeyMsg(msg)
 		if err != nil {
 			break
-		}
-
-		if isQuery {
-			if err := p.sendOKMsg(downStreamPublicKey); err != nil {
-				return nil, err
-			}
-			return nil, nil
 		}
 
 		// Validate the downstream ssh key
 		_, err = p.serverConfig.PublicKeyCallback(p.Downstream, downStreamPublicKey)
 		if err != nil {
 			return noneAuthMsg(username), nil
+		}
+
+		var sig *Signature
+
+		if isQuery {
+			if len(payload) > 0 {
+				return nil, parseError(msgUserAuthRequest)
+			}
+
+			if err := p.sendOKMsg(downStreamPublicKey); err != nil {
+				return nil, err
+			}
+			return nil, nil
+		} else {
+			var ok bool
+			sig, payload, ok = parseSignature(payload)
+			if !ok || len(payload) > 0 {
+				return nil, parseError(msgUserAuthRequest)
+			}
 		}
 
 		// Verify the downstream signature
@@ -331,7 +343,7 @@ func (p *proxyConn) authenticateProxyConn(initUserAuthMsg *userAuthRequestMsg) e
 	}
 }
 
-func parsePublicKeyMsg(userAuthReq *userAuthRequestMsg) (PublicKey, bool, *Signature, error) {
+func parsePublicKeyMsg(userAuthReq *userAuthRequestMsg) (PublicKey, bool, []byte, error) {
 	if userAuthReq.Method != "publickey" {
 		return nil, false, nil, fmt.Errorf("not a publickey auth msg")
 	}
@@ -361,15 +373,7 @@ func parsePublicKeyMsg(userAuthReq *userAuthRequestMsg) (PublicKey, bool, *Signa
 		return nil, false, nil, err
 	}
 
-	var sig *Signature
-	if !isQuery {
-		sig, payload, ok = parseSignature(payload)
-		if !ok || len(payload) > 0 {
-			return nil, false, nil, parseError(msgUserAuthRequest)
-		}
-	}
-
-	return publicKey, isQuery, sig, nil
+	return publicKey, isQuery, payload, nil
 }
 
 func piping(dst, src packetConn) error {
