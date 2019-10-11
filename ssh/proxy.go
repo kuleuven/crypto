@@ -7,6 +7,7 @@ package ssh
 import (
 	"errors"
 	"fmt"
+	"io"
 	"net"
 )
 
@@ -255,7 +256,7 @@ func (p *proxyConn) Wait() error {
 		c <- piping(p.Downstream.transport, p.Upstream.transport)
 	}()
 
-	defer p.Close()
+	//defer p.Close()
 	return <-c
 }
 
@@ -377,9 +378,13 @@ func parsePublicKeyMsg(userAuthReq *userAuthRequestMsg) (PublicKey, bool, []byte
 }
 
 func piping(dst, src packetConn) error {
+	defer dst.Close()
+
 	for {
 		p, err := src.readPacket()
-		if err != nil {
+		if err == io.EOF {
+			return nil
+		} else if err != nil {
 			return err
 		}
 
