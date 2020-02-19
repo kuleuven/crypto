@@ -34,6 +34,8 @@ import (
 // package.
 const (
 	KeyAlgoRSA        = "ssh-rsa"
+	KeyAlgoRSASHA2256 = "rsa-sha2-256"
+	KeyAlgoRSASHA2512 = "rsa-sha2-512"
 	KeyAlgoDSA        = "ssh-dss"
 	KeyAlgoECDSA256   = "ecdsa-sha2-nistp256"
 	KeyAlgoSKECDSA256 = "sk-ecdsa-sha2-nistp256@openssh.com"
@@ -57,7 +59,7 @@ const (
 // Use ParsePublicKey for keys with prepended algorithm.
 func parsePubKey(in []byte, algo string) (pubKey PublicKey, rest []byte, err error) {
 	switch algo {
-	case KeyAlgoRSA:
+	case KeyAlgoRSA, KeyAlgoRSASHA2256, KeyAlgoRSASHA2512:
 		return parseRSA(in)
 	case KeyAlgoDSA:
 		return parseDSA(in)
@@ -69,7 +71,7 @@ func parsePubKey(in []byte, algo string) (pubKey PublicKey, rest []byte, err err
 		return parseED25519(in)
 	case KeyAlgoSKED25519:
 		return parseSKEd25519(in)
-	case CertAlgoRSAv01, CertAlgoDSAv01, CertAlgoECDSA256v01, CertAlgoECDSA384v01, CertAlgoECDSA521v01, CertAlgoSKECDSA256v01, CertAlgoED25519v01, CertAlgoSKED25519v01:
+	case CertAlgoRSAv01, CertAlgoRSASHA2256v01, CertAlgoRSASHA2512v01, CertAlgoDSAv01, CertAlgoECDSA256v01, CertAlgoECDSA384v01, CertAlgoECDSA521v01, CertAlgoSKECDSA256v01, CertAlgoED25519v01, CertAlgoSKED25519v01:
 		cert, err := parseCert(in, certToPrivAlgo(algo))
 		if err != nil {
 			return nil, nil, err
@@ -937,6 +939,23 @@ func newDSAPrivateKey(key *dsa.PrivateKey) (Signer, error) {
 	}
 
 	return &dsaPrivateKey{key}, nil
+}
+
+type defaultAlgorithmSigner struct {
+	AlgorithmSigner
+	algorithm string
+}
+
+func (s *defaultAlgorithmSigner) PublicKey() PublicKey {
+	return s.AlgorithmSigner.PublicKey()
+}
+
+func (s *defaultAlgorithmSigner) Sign(rand io.Reader, data []byte) (*Signature, error) {
+	return s.AlgorithmSigner.SignWithAlgorithm(rand, data, s.algorithm)
+}
+
+func (s *defaultAlgorithmSigner) SignWithAlgorithm(rand io.Reader, data []byte, algorithm string) (*Signature, error) {
+	return s.AlgorithmSigner.SignWithAlgorithm(rand, data, algorithm)
 }
 
 type wrappedSigner struct {

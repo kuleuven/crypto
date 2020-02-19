@@ -434,7 +434,7 @@ func testHandshakeErrorHandlingN(t *testing.T, readLimit, writeLimit int, couple
 	serverConf := Config{RekeyThreshold: minRekeyThreshold}
 	serverConf.SetDefaults()
 	serverConn := newHandshakeTransport(&errorKeyingTransport{a, readLimit, writeLimit}, &serverConf, []byte{'a'}, []byte{'b'})
-	serverConn.hostKeys = []Signer{key}
+	serverConn.hostKeys = map[string]Signer{key.PublicKey().Type(): key}
 	go serverConn.readLoop()
 	go serverConn.kexLoop()
 
