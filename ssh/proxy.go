@@ -148,23 +148,37 @@ func (p *proxyConn) handleAuthMsg(msg *userAuthRequestMsg) (*userAuthRequestMsg,
 
 		// Get the upstream authMethod
 		for _, authMethod := range p.clientConfig.Auth {
-			f, ok := authMethod.(publicKeyCallback)
-			if !ok {
-				break
-			}
-
-			signers, err := f()
-			if err != nil || len(signers) == 0 {
-				break
-			}
-
-			for _, signer := range signers {
-				msg, err = p.signAgain(p.clientConfig.User, msg, signer)
-				if err != nil {
+			if f, ok := authMethod.(publicKeyCallback); ok {
+				signers, err := f()
+				if err != nil || len(signers) == 0 {
 					break
 				}
-				return msg, nil
+
+				for _, signer := range signers {
+					msg, err = p.signAgain(p.clientConfig.User, msg, signer)
+					if err != nil {
+						break
+					}
+					return msg, nil
+				}
 			}
+
+			if f, ok := authMethod.(hostBasedCallback); ok {
+				signers, clientHost, clientUser, err := f()
+				if err != nil || len(signers) == 0 {
+					break
+				}
+
+				for _, signer := range signers {
+					msg, err = p.signAgainHostBased(p.clientConfig.User, msg, signer, clientHost, clientUser)
+					if err != nil {
+						break
+					}
+					return msg, nil
+				}
+			}
+
+			break
 		}
 
 	case "password":
@@ -238,6 +252,42 @@ func (p *proxyConn) signAgain(user string, msg *userAuthRequestMsg, signer Signe
 		Algoname: upStreamPublicKey.Type(),
 		PubKey:   upStreamPublicKeyData,
 		Sig:      sig,
+	}
+
+	Unmarshal(Marshal(publicKeyMsg), msg)
+
+	return msg, nil
+}
+
+func (p *proxyConn) signAgainHostBased(user string, msg *userAuthRequestMsg, signer Signer, clientHost string, clientUser string) (*userAuthRequestMsg, error) {
+	rand := p.Upstream.transport.config.Rand
+	sessionID := p.Upstream.transport.getSessionID()
+	upStreamPublicKey := signer.PublicKey()
+	upStreamPublicKeyData := upStreamPublicKey.Marshal()
+
+	sign, err := signer.Sign(rand, buildDataSignedForHostBasedAuth(sessionID, userAuthRequestMsg{
+		User:    user,
+		Service: serviceSSH,
+		Method:  "hostbased",
+	}, []byte(upStreamPublicKey.Type()), upStreamPublicKeyData, clientHost, clientUser))
+	if err != nil {
+		return nil, err
+	}
+
+	// manually wrap the serialized signature in a string
+	s := Marshal(sign)
+	sig := make([]byte, stringLength(len(s)))
+	marshalString(sig, s)
+
+	publicKeyMsg := &hostbasedAuthMsg{
+		User:       user,
+		Service:    serviceSSH,
+		Method:     "hostbased",
+		Algoname:   upStreamPublicKey.Type(),
+		PubKey:     upStreamPublicKeyData,
+		ClientHost: clientHost,
+		ClientUser: clientUser,
+		Sig:        sig,
 	}
 
 	Unmarshal(Marshal(publicKeyMsg), msg)
