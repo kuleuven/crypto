@@ -44,9 +44,8 @@ func (msg *userAuthRequestMsg) GetPayload() []byte {
 }
 
 type ProxyConfig struct {
-	ServerConfig         *ServerConfig
-	UpstreamCallback     func(AuthRequestMsg) (net.Conn, error)
-	ClientConfigCallback func(AuthRequestMsg) (*ClientConfig, error)
+	ServerConfig     *ServerConfig
+	UpstreamCallback func(AuthRequestMsg) (net.Conn, *ClientConfig, error)
 }
 
 type proxyConn struct {
@@ -72,12 +71,7 @@ func NewProxyConn(conn net.Conn, config *ProxyConfig) (pConn *proxyConn, err err
 		return nil, err
 	}
 
-	clientConfig, err := config.ClientConfigCallback(authRequestMsg)
-	if err != nil {
-		return nil, err
-	}
-
-	upConn, err := config.UpstreamCallback(authRequestMsg)
+	upConn, clientConfig, err := config.UpstreamCallback(authRequestMsg)
 	if err != nil {
 		return nil, err
 	}
