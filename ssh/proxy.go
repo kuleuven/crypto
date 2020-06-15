@@ -100,11 +100,13 @@ func NewProxyConn(conn net.Conn, config *ProxyConfig) (pConn *proxyConn, err err
 	return pConn, nil
 }
 
+// Handle client authentication, intercepts publickey messages
+// Returns userAuthRequestMsg to be sent to the upstream server
 func (p *proxyConn) handleAuthMsg(msg *userAuthRequestMsg) (*userAuthRequestMsg, error) {
 	username := msg.User
 	switch msg.Method {
 	case "publickey":
-		downStreamPublicKey, isQuery, payload, err := parsePublicKeyMsg(msg)
+		downStreamPublicKey, isQuery, algo, pubkeyData, payload, err := parsePublicKeyMsg(msg)
 		if err != nil {
 			break
 		}
@@ -122,7 +124,7 @@ func (p *proxyConn) handleAuthMsg(msg *userAuthRequestMsg) (*userAuthRequestMsg,
 				return nil, parseError(msgUserAuthRequest)
 			}
 
-			if err := p.sendOKMsg(downStreamPublicKey); err != nil {
+			if err := p.sendOKMsg(algo, pubkeyData); err != nil {
 				return nil, err
 			}
 			return nil, nil
@@ -189,10 +191,10 @@ func (p *proxyConn) handleAuthMsg(msg *userAuthRequestMsg) (*userAuthRequestMsg,
 	return nil, err
 }
 
-func (p *proxyConn) sendOKMsg(key PublicKey) error {
+func (p *proxyConn) sendOKMsg(algo string, pubkeyData []byte) error {
 	okMsg := userAuthPubKeyOkMsg{
-		Algo:   key.Type(),
-		PubKey: key.Marshal(),
+		Algo:   algo,
+		PubKey: pubkeyData,
 	}
 
 	return p.Downstream.transport.writePacket(Marshal(&okMsg))
@@ -388,37 +390,37 @@ func (p *proxyConn) authenticateProxyConn(initUserAuthMsg *userAuthRequestMsg) e
 	}
 }
 
-func parsePublicKeyMsg(userAuthReq *userAuthRequestMsg) (PublicKey, bool, []byte, error) {
+func parsePublicKeyMsg(userAuthReq *userAuthRequestMsg) (PublicKey, bool, string, []byte, []byte, error) {
 	if userAuthReq.Method != "publickey" {
-		return nil, false, nil, fmt.Errorf("not a publickey auth msg")
+		return nil, false, "", nil, nil, fmt.Errorf("not a publickey auth msg")
 	}
 
 	payload := userAuthReq.Payload
 	if len(payload) < 1 {
-		return nil, false, nil, parseError(msgUserAuthRequest)
+		return nil, false, "", nil, nil, parseError(msgUserAuthRequest)
 	}
 	isQuery := payload[0] == 0
 	payload = payload[1:]
 	algoBytes, payload, ok := parseString(payload)
 	if !ok {
-		return nil, false, nil, parseError(msgUserAuthRequest)
+		return nil, false, "", nil, nil, parseError(msgUserAuthRequest)
 	}
 	algo := string(algoBytes)
 	if !isAcceptableAlgo(algo) {
-		return nil, false, nil, fmt.Errorf("ssh: algorithm %q not accepted", algo)
+		return nil, false, "", nil, nil, fmt.Errorf("ssh: algorithm %q not accepted", algo)
 	}
 
 	pubKeyData, payload, ok := parseString(payload)
 	if !ok {
-		return nil, false, nil, parseError(msgUserAuthRequest)
+		return nil, false, "", nil, nil, parseError(msgUserAuthRequest)
 	}
 
 	publicKey, err := ParsePublicKey(pubKeyData)
 	if err != nil {
-		return nil, false, nil, err
+		return nil, false, "", nil, nil, err
 	}
 
-	return publicKey, isQuery, payload, nil
+	return publicKey, isQuery, algo, pubKeyData, payload, nil
 }
 
 func piping(dst, src packetConn) error {
