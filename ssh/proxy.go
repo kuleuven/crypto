@@ -60,6 +60,8 @@ type ProxyConfig struct {
 type ProxyConn interface {
 	Wait() error
 	Close()
+	UpstreamConn() ConnMetadata
+	DownstreamConn() ConnMetadata
 }
 
 // Implementation of ProxyConn
@@ -357,6 +359,14 @@ func (p *proxyConn) Wait() error {
 func (p *proxyConn) Close() {
 	p.Upstream.transport.Close()
 	p.Downstream.transport.Close()
+}
+
+func (p *proxyConn) UpstreamConn() ConnMetadata {
+	return p.Upstream
+}
+
+func (p *proxyConn) DownstreamConn() ConnMetadata {
+	return p.Downstream
 }
 
 func (p *proxyConn) checkBridgeAuthWithNoBanner(packet []byte) (bool, error) {
