@@ -18,8 +18,7 @@ var (
 	userPrivateKeyFile     userFile = "id_rsa"
 )
 
-type AuthType int
-
+// A AuthRequestMsg exposes userAuthRequestMsg
 type AuthRequestMsg interface {
 	GetUser() string
 	GetService() string
@@ -43,19 +42,39 @@ func (msg *userAuthRequestMsg) GetPayload() []byte {
 	return msg.Payload
 }
 
+// ProxyConfig represents configuration of a ssh proxy
 type ProxyConfig struct {
-	ServerConfig     *ServerConfig
+	// ServerConfig represents the server configuration of the proxy, that is the configuration exposed to clients
+	// Note that only PublicKeyCallback is used, other authentication methods are passed through to the backend
+	ServerConfig *ServerConfig
+	// UpstreamCallback is used to find the client configuration when connection to the backend hosts
+	// The ClientConfig can either be public key authentication or hostbased authentication, other methods are ignored
 	UpstreamCallback func(AuthRequestMsg) (net.Conn, *ClientConfig, error)
+	// LimitAuthMethod indicates whether other authentication methods than public key authentication is allowed
+	// Set to true to only accept public key authentication, and to false to pass through other methods to the backend
+	// Note that hostbased authentication on the frontend is always ignored
+	LimitAuthMethod bool
 }
 
+// A ProxyConn represents a ssh proxy
+type ProxyConn interface {
+	Wait() error
+	Close()
+}
+
+// Implementation of ProxyConn
 type proxyConn struct {
+	*ProxyConfig
 	serverConfig *ServerConfig
 	clientConfig *ClientConfig
 	Upstream     *connection
 	Downstream   *connection
 }
 
-func NewProxyConn(conn net.Conn, config *ProxyConfig) (pConn *proxyConn, err error) {
+// NewProxyConn returns a new ProxyConn
+func NewProxyConn(conn net.Conn, config *ProxyConfig) (ProxyConn, error) {
+	var pConn *proxyConn
+
 	d, err := newDownstreamConn(conn, config.ServerConfig)
 	if err != nil {
 		return nil, err
@@ -87,6 +106,7 @@ func NewProxyConn(conn net.Conn, config *ProxyConfig) (pConn *proxyConn, err err
 	}()
 
 	pConn = &proxyConn{
+		ProxyConfig:  config,
 		serverConfig: config.ServerConfig,
 		clientConfig: clientConfig,
 		Upstream:     u,
@@ -105,6 +125,13 @@ func NewProxyConn(conn net.Conn, config *ProxyConfig) (pConn *proxyConn, err err
 func (p *proxyConn) handleAuthMsg(msg *userAuthRequestMsg) (*userAuthRequestMsg, error) {
 	username := msg.User
 	switch msg.Method {
+	case "none":
+		if p.LimitAuthMethod {
+			break
+		}
+
+		return msg, nil
+
 	case "publickey":
 		downStreamPublicKey, isQuery, algo, pubkeyData, payload, err := parsePublicKeyMsg(msg)
 		if err != nil {
@@ -114,6 +141,11 @@ func (p *proxyConn) handleAuthMsg(msg *userAuthRequestMsg) (*userAuthRequestMsg,
 		// Validate the downstream ssh key
 		_, err = p.serverConfig.PublicKeyCallback(p.Downstream, downStreamPublicKey)
 		if err != nil {
+			// Invalid public key, redirect as 'none'
+			if p.LimitAuthMethod {
+				break
+			}
+
 			return noneAuthMsg(username), nil
 		}
 
@@ -177,14 +209,30 @@ func (p *proxyConn) handleAuthMsg(msg *userAuthRequestMsg) (*userAuthRequestMsg,
 			break
 		}
 
+	case "hostbased":
+		// Hostbased authentication is not supported, redirect as 'none'
+		if p.LimitAuthMethod {
+			break
+		}
+
+		return noneAuthMsg(username), nil
+
 	case "password":
-		// In the case of password authentication,
+	default:
+		// In the case of password authentication or others,
 		// since authentication is left up to the upstream server,
 		// it suffices to flow the packet as it is.
-		return msg, nil
+		if p.LimitAuthMethod {
+			break
+		}
 
-	default:
 		return msg, nil
+	}
+
+	// Some error occurred, or a wrong authentication method was used
+	if p.LimitAuthMethod {
+		err := p.sendFailureMsg("publickey")
+		return nil, err
 	}
 
 	err := p.sendFailureMsg(msg.Method)
@@ -324,6 +372,12 @@ func (p *proxyConn) checkBridgeAuthWithNoBanner(packet []byte) (bool, error) {
 		}
 
 		msgType := packet[0]
+
+		// If LimitAuthMethod is set, do not expose the methods of the backend
+		if msgType == msgUserAuthFailure && p.LimitAuthMethod {
+			err := p.sendFailureMsg("publickey")
+			return false, err
+		}
 
 		if err = p.Downstream.transport.writePacket(packet); err != nil {
 			return false, err
