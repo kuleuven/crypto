@@ -124,27 +124,45 @@ func NewProxyConn(conn net.Conn, config *ProxyConfig) (ProxyConn, error) {
 
 // Handle client authentication, intercepts publickey messages
 // Returns userAuthRequestMsg to be sent to the upstream server
-func (p *proxyConn) handleAuthMsg(msg *userAuthRequestMsg) (*userAuthRequestMsg, error) {
+func (p *proxyConn) handleAuthMsg(msg *userAuthRequestMsg, cache *pubKeyCache) (*userAuthRequestMsg, error) {
 	username := msg.User
+
+	var authErr error
+
 	switch msg.Method {
 	case "none":
 		if p.LimitAuthMethod {
-			break
+			err := p.sendFailureMsg("publickey")
+			return nil, err
 		}
 
 		return msg, nil
 
 	case "publickey":
-		downStreamPublicKey, isQuery, algo, pubkeyData, payload, err := parsePublicKeyMsg(msg)
+		downStreamPublicKey, isQuery, algo, pubKeyData, payload, err := parsePublicKeyMsg(msg)
 		if err != nil {
-			break
+			return nil, err
+		}
+
+		// Retrieve PublicKeyCallback output
+		candidate, ok := cache.get(username, pubKeyData)
+		if !ok {
+			candidate.user = username
+			candidate.pubKeyData = pubKeyData
+			candidate.perms, candidate.result = p.serverConfig.PublicKeyCallback(p.Downstream, downStreamPublicKey)
+			if candidate.result == nil && candidate.perms != nil && candidate.perms.CriticalOptions != nil && candidate.perms.CriticalOptions[sourceAddressCriticalOption] != "" {
+				candidate.result = checkSourceAddress(
+					p.Downstream.RemoteAddr(),
+					candidate.perms.CriticalOptions[sourceAddressCriticalOption])
+			}
+			cache.add(candidate)
 		}
 
 		// Validate the downstream ssh key
-		_, err = p.serverConfig.PublicKeyCallback(p.Downstream, downStreamPublicKey)
-		if err != nil {
+		if candidate.result != nil {
 			// Invalid public key, redirect as 'none'
 			if p.LimitAuthMethod {
+				authErr = candidate.result
 				break
 			}
 
@@ -158,7 +176,7 @@ func (p *proxyConn) handleAuthMsg(msg *userAuthRequestMsg) (*userAuthRequestMsg,
 				return nil, parseError(msgUserAuthRequest)
 			}
 
-			if err := p.sendOKMsg(algo, pubkeyData); err != nil {
+			if err := p.sendOKMsg(algo, pubKeyData); err != nil {
 				return nil, err
 			}
 			return nil, nil
@@ -171,8 +189,9 @@ func (p *proxyConn) handleAuthMsg(msg *userAuthRequestMsg) (*userAuthRequestMsg,
 		}
 
 		// Verify the downstream signature
-		ok, err := p.verifySignature(msg, downStreamPublicKey, sig)
+		ok, err = p.verifySignature(msg, downStreamPublicKey, sig)
 		if err != nil || !ok {
+			authErr = err
 			break
 		}
 
@@ -181,12 +200,14 @@ func (p *proxyConn) handleAuthMsg(msg *userAuthRequestMsg) (*userAuthRequestMsg,
 			if f, ok := authMethod.(publicKeyCallback); ok {
 				signers, err := f()
 				if err != nil || len(signers) == 0 {
+					authErr = err
 					break
 				}
 
 				for _, signer := range signers {
 					msg, err = p.signAgain(p.clientConfig.User, msg, signer)
 					if err != nil {
+						authErr = err
 						break
 					}
 					return msg, nil
@@ -196,12 +217,14 @@ func (p *proxyConn) handleAuthMsg(msg *userAuthRequestMsg) (*userAuthRequestMsg,
 			if f, ok := authMethod.(hostBasedCallback); ok {
 				signers, clientHost, clientUser, err := f()
 				if err != nil || len(signers) == 0 {
+					authErr = err
 					break
 				}
 
 				for _, signer := range signers {
 					msg, err = p.signAgainHostBased(p.clientConfig.User, msg, signer, clientHost, clientUser)
 					if err != nil {
+						authErr = err
 						break
 					}
 					return msg, nil
@@ -214,6 +237,7 @@ func (p *proxyConn) handleAuthMsg(msg *userAuthRequestMsg) (*userAuthRequestMsg,
 	case "hostbased":
 		// Hostbased authentication is not supported, redirect as 'none'
 		if p.LimitAuthMethod {
+			authErr = fmt.Errorf("ssh: method %q not accepted", msg.Method)
 			break
 		}
 
@@ -225,10 +249,15 @@ func (p *proxyConn) handleAuthMsg(msg *userAuthRequestMsg) (*userAuthRequestMsg,
 		// since authentication is left up to the upstream server,
 		// it suffices to flow the packet as it is.
 		if p.LimitAuthMethod {
+			authErr = fmt.Errorf("ssh: method %q not accepted", msg.Method)
 			break
 		}
 
 		return msg, nil
+	}
+
+	if p.ServerConfig.AuthLogCallback != nil {
+		p.ServerConfig.AuthLogCallback(p.Downstream, msg.Method, authErr)
 	}
 
 	// Some error occurred, or a wrong authentication method was used
@@ -412,9 +441,11 @@ func (p *proxyConn) authenticateProxyConn(initUserAuthMsg *userAuthRequestMsg) e
 		return err
 	}
 
+	var cache pubKeyCache
+
 	userAuthMsg := initUserAuthMsg
 	for {
-		userAuthMsg, err = p.handleAuthMsg(userAuthMsg)
+		userAuthMsg, err = p.handleAuthMsg(userAuthMsg, &cache)
 		if err != nil {
 			fmt.Println(err)
 		}
