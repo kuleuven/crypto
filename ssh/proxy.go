@@ -42,10 +42,14 @@ func (msg *userAuthRequestMsg) GetPayload() []byte {
 	return msg.Payload
 }
 
+// ErrNeedsSecondFactor may be returned by a ProxyConfig PublicKeyCallback to indicate a second factor is needed.
+var ErrNeedsSecondFactor = errors.New("needs second factor")
+
 // ProxyConfig represents configuration of a ssh proxy
 type ProxyConfig struct {
 	// ServerConfig represents the server configuration of the proxy, that is the configuration exposed to clients
-	// Note that only PublicKeyCallback is used, other authentication methods are passed through to the backend
+	// Note that only PublicKeyCallback is used, other authentication methods are passed through to the backend unless LimitAuthMethod is set.
+	// The PublicKeyCallback may return ErrNeedsSecondFactor when a second factor is needed.
 	ServerConfig *ServerConfig
 	// UpstreamCallback is used to find the client configuration when connection to the backend hosts
 	// The ClientConfig can either be public key authentication or hostbased authentication, other methods are ignored
@@ -54,6 +58,9 @@ type ProxyConfig struct {
 	// Set to true to only accept public key authentication, and to false to pass through other methods to the backend
 	// Note that hostbased authentication on the frontend is always ignored
 	LimitAuthMethod bool
+	// Second factor keyboard interactive callback, is passed as second factor by PublicKeyCallbacks if configured.
+	// Actual permissions are ignored, first factor should have checked them.
+	SecondFactorCallback func(conn ConnMetadata, client KeyboardInteractiveChallenge) (*Permissions, error)
 }
 
 // A ProxyConn represents a ssh proxy
@@ -124,7 +131,7 @@ func NewProxyConn(conn net.Conn, config *ProxyConfig) (ProxyConn, error) {
 
 // Handle client authentication, intercepts publickey messages
 // Returns userAuthRequestMsg to be sent to the upstream server
-func (p *proxyConn) handleAuthMsg(msg *userAuthRequestMsg, cache *pubKeyCache) (*userAuthRequestMsg, error) {
+func (p *proxyConn) handleAuthMsg(msg *userAuthRequestMsg, cache *pubKeyCache, partialSuccess *bool) (*userAuthRequestMsg, error) {
 	username := msg.User
 
 	var authErr error
@@ -132,7 +139,7 @@ func (p *proxyConn) handleAuthMsg(msg *userAuthRequestMsg, cache *pubKeyCache) (
 	switch msg.Method {
 	case "none":
 		if p.LimitAuthMethod {
-			err := p.sendFailureMsg("publickey")
+			err := p.sendFailureMsg("publickey", false)
 			return nil, err
 		}
 
@@ -159,7 +166,7 @@ func (p *proxyConn) handleAuthMsg(msg *userAuthRequestMsg, cache *pubKeyCache) (
 		}
 
 		// Validate the downstream ssh key
-		if candidate.result != nil {
+		if candidate.result != nil && (candidate.result != ErrNeedsSecondFactor || p.SecondFactorCallback == nil) {
 			// Invalid public key, redirect as 'none'
 			if p.LimitAuthMethod {
 				authErr = candidate.result
@@ -195,44 +202,52 @@ func (p *proxyConn) handleAuthMsg(msg *userAuthRequestMsg, cache *pubKeyCache) (
 			break
 		}
 
-		// Get the upstream authMethod
-		for _, authMethod := range p.clientConfig.Auth {
-			if f, ok := authMethod.(publicKeyCallback); ok {
-				signers, err := f()
-				if err != nil || len(signers) == 0 {
-					authErr = err
-					break
-				}
+		// Second factor: Return partial success
+		if candidate.result == ErrNeedsSecondFactor {
+			// Track session
+			*partialSuccess = true
 
-				for _, signer := range signers {
-					msg, err = p.signAgain(p.clientConfig.User, msg, signer)
-					if err != nil {
-						authErr = err
-						break
-					}
-					return msg, nil
-				}
-			}
+			err := p.sendFailureMsg("keyboard-interactive", true)
+			return nil, err
+		}
 
-			if f, ok := authMethod.(hostBasedCallback); ok {
-				signers, clientHost, clientUser, err := f()
-				if err != nil || len(signers) == 0 {
-					authErr = err
-					break
-				}
+		// Get the upstream auth message
+		var signedMsg *userAuthRequestMsg
 
-				for _, signer := range signers {
-					msg, err = p.signAgainHostBased(p.clientConfig.User, msg, signer, clientHost, clientUser)
-					if err != nil {
-						authErr = err
-						break
-					}
-					return msg, nil
+		signedMsg, authErr = p.signAgain(msg)
+		if signedMsg != nil {
+			return signedMsg, nil
+		}
+
+	case "keyboard-interactive":
+		// Only do this if it is our second factor authentication
+		if *partialSuccess {
+			// Handle our second factor
+			prompter := &sshClientKeyboardInteractive{p.Downstream}
+			_, authErr = p.SecondFactorCallback(p.Downstream, prompter.Challenge)
+
+			if authErr == nil {
+				// Get the upstream auth message
+				var signedMsg *userAuthRequestMsg
+
+				signedMsg, authErr = p.signAgain(msg)
+				if signedMsg != nil {
+					return signedMsg, nil
 				}
 			}
 
 			break
 		}
+
+		// In the case it is not our second factor,
+		// since authentication is left up to the upstream server,
+		// it suffices to flow the packet as it is.
+		if p.LimitAuthMethod {
+			authErr = fmt.Errorf("ssh: method %q not accepted", msg.Method)
+			break
+		}
+
+		return msg, nil
 
 	case "hostbased":
 		// Hostbased authentication is not supported, redirect as 'none'
@@ -262,11 +277,11 @@ func (p *proxyConn) handleAuthMsg(msg *userAuthRequestMsg, cache *pubKeyCache) (
 
 	// Some error occurred, or a wrong authentication method was used
 	if p.LimitAuthMethod {
-		err := p.sendFailureMsg("publickey")
+		err := p.sendFailureMsg("publickey", false)
 		return nil, err
 	}
 
-	err := p.sendFailureMsg(msg.Method)
+	err := p.sendFailureMsg(msg.Method, false)
 	return nil, err
 }
 
@@ -279,9 +294,11 @@ func (p *proxyConn) sendOKMsg(algo string, pubkeyData []byte) error {
 	return p.Downstream.transport.writePacket(Marshal(&okMsg))
 }
 
-func (p *proxyConn) sendFailureMsg(method string) error {
-	var failureMsg userAuthFailureMsg
-	failureMsg.Methods = append(failureMsg.Methods, method)
+func (p *proxyConn) sendFailureMsg(method string, partialSuccess bool) error {
+	var failureMsg = userAuthFailureMsg{
+		PartialSuccess: partialSuccess,
+		Methods:        []string{method},
+	}
 
 	return p.Downstream.transport.writePacket(Marshal(&failureMsg))
 }
@@ -299,7 +316,45 @@ func (p *proxyConn) verifySignature(msg *userAuthRequestMsg, publicKey PublicKey
 	return true, nil
 }
 
-func (p *proxyConn) signAgain(user string, msg *userAuthRequestMsg, signer Signer) (*userAuthRequestMsg, error) {
+func (p *proxyConn) signAgain(msg *userAuthRequestMsg) (*userAuthRequestMsg, error) {
+	for _, authMethod := range p.clientConfig.Auth {
+		if f, ok := authMethod.(publicKeyCallback); ok {
+			signers, err := f()
+			if err != nil || len(signers) == 0 {
+				return nil, err
+			}
+
+			for _, signer := range signers {
+				msg, err = p.signAgainPublicKey(p.clientConfig.User, msg, signer)
+				if err != nil {
+					return nil, err
+				}
+				return msg, nil
+			}
+		}
+
+		if f, ok := authMethod.(hostBasedCallback); ok {
+			signers, clientHost, clientUser, err := f()
+			if err != nil || len(signers) == 0 {
+				return nil, err
+			}
+
+			for _, signer := range signers {
+				msg, err = p.signAgainHostBased(p.clientConfig.User, msg, signer, clientHost, clientUser)
+				if err != nil {
+					return nil, err
+				}
+				return msg, nil
+			}
+		}
+
+		return nil, nil
+	}
+
+	return nil, nil
+}
+
+func (p *proxyConn) signAgainPublicKey(user string, msg *userAuthRequestMsg, signer Signer) (*userAuthRequestMsg, error) {
 	rand := p.Upstream.transport.config.Rand
 	sessionID := p.Upstream.transport.getSessionID()
 	upStreamPublicKey := signer.PublicKey()
@@ -414,7 +469,7 @@ func (p *proxyConn) checkBridgeAuthWithNoBanner(packet []byte) (bool, error) {
 
 		// If LimitAuthMethod is set, do not expose the methods of the backend
 		if msgType == msgUserAuthFailure && p.LimitAuthMethod {
-			err := p.sendFailureMsg("publickey")
+			err := p.sendFailureMsg("publickey", false)
 			return false, err
 		}
 
@@ -442,10 +497,11 @@ func (p *proxyConn) authenticateProxyConn(initUserAuthMsg *userAuthRequestMsg) e
 	}
 
 	var cache pubKeyCache
+	var partialSuccess bool
 
 	userAuthMsg := initUserAuthMsg
 	for {
-		userAuthMsg, err = p.handleAuthMsg(userAuthMsg, &cache)
+		userAuthMsg, err = p.handleAuthMsg(userAuthMsg, &cache, &partialSuccess)
 		if err != nil {
 			fmt.Println(err)
 		}
