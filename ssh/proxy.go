@@ -157,11 +157,17 @@ func (p *proxyConn) handleAuthMsg(msg *userAuthRequestMsg, cache *pubKeyCache, p
 			candidate.user = username
 			candidate.pubKeyData = pubKeyData
 			candidate.perms, candidate.result = p.serverConfig.PublicKeyCallback(p.Downstream, downStreamPublicKey)
-			if candidate.result == nil && candidate.perms != nil && candidate.perms.CriticalOptions != nil && candidate.perms.CriticalOptions[sourceAddressCriticalOption] != "" {
-				candidate.result = checkSourceAddress(
+
+			if (candidate.result == nil || candidate.result == ErrNeedsSecondFactor) && candidate.perms != nil && candidate.perms.CriticalOptions != nil && candidate.perms.CriticalOptions[sourceAddressCriticalOption] != "" {
+				result := checkSourceAddress(
 					p.Downstream.RemoteAddr(),
 					candidate.perms.CriticalOptions[sourceAddressCriticalOption])
+
+				if result != nil {
+					candidate.result = result
+				}
 			}
+
 			cache.add(candidate)
 		}
 
