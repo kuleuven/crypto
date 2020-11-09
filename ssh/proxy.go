@@ -59,8 +59,15 @@ type ProxyConfig struct {
 	// Note that hostbased authentication on the frontend is always ignored
 	LimitAuthMethod bool
 	// Second factor keyboard interactive callback, is passed as second factor by PublicKeyCallbacks if configured.
-	// Actual permissions are ignored, first factor should have checked them.
-	SecondFactorCallback func(conn ConnMetadata, client KeyboardInteractiveChallenge) (*Permissions, error)
+	// The parameter firstFactorSucceeded indicates whether a valid first factor has been provided. It will be true unless
+	// SecondFactorAsOnlyFactor is enabled, and the second factor is requested as only factor.
+	// Actual permissions are ignored unless unless the second factor is used as only factor, as first factor should have checked them.
+	SecondFactorCallback func(conn ConnMetadata, client KeyboardInteractiveChallenge, firstFactorSucceeded bool) (*Permissions, error)
+	// Allow the use of second factor as the only factor, without providing any valid key to the above PublicKeyCallback.
+	// This will make that all keyboard-interactive challenges are handled by the proxy (regardless of the value of LimitAuthMethod).
+	// Please make sure that SecondFactorCallback does not cache valid authentications when firstFactorSucceeded is false,
+	// e.g. based on the connecting ip address.
+	SecondFactorAsOnlyFactor bool
 }
 
 // A ProxyConn represents a ssh proxy
@@ -139,7 +146,7 @@ func (p *proxyConn) handleAuthMsg(msg *userAuthRequestMsg, cache *pubKeyCache, p
 	switch msg.Method {
 	case "none":
 		if p.LimitAuthMethod {
-			err := p.sendFailureMsg("publickey", false)
+			err := p.sendFailureMsg(nil, false)
 			return nil, err
 		}
 
@@ -213,7 +220,7 @@ func (p *proxyConn) handleAuthMsg(msg *userAuthRequestMsg, cache *pubKeyCache, p
 			// Track session
 			*partialSuccess = true
 
-			err := p.sendFailureMsg("keyboard-interactive", true)
+			err := p.sendFailureMsg([]string{"keyboard-interactive"}, true)
 			return nil, err
 		}
 
@@ -226,11 +233,21 @@ func (p *proxyConn) handleAuthMsg(msg *userAuthRequestMsg, cache *pubKeyCache, p
 		}
 
 	case "keyboard-interactive":
-		// Only do this if it is our second factor authentication
-		if *partialSuccess {
+		// Only do this if it is our second factor authentication, or we may use second factor as first and only factor
+		if *partialSuccess || (p.SecondFactorAsOnlyFactor && p.SecondFactorCallback != nil) {
 			// Handle our second factor
 			prompter := &sshClientKeyboardInteractive{p.Downstream}
-			_, authErr = p.SecondFactorCallback(p.Downstream, prompter.Challenge)
+
+			var perms *Permissions
+
+			perms, authErr = p.SecondFactorCallback(p.Downstream, prompter.Challenge, *partialSuccess)
+
+			// Check permissions for critical options, only when used as first factor
+			if !*partialSuccess && authErr == nil && perms != nil && perms.CriticalOptions != nil && perms.CriticalOptions[sourceAddressCriticalOption] != "" {
+				authErr = checkSourceAddress(
+					p.Downstream.RemoteAddr(),
+					perms.CriticalOptions[sourceAddressCriticalOption])
+			}
 
 			if authErr == nil {
 				// Get the upstream auth message
@@ -282,12 +299,7 @@ func (p *proxyConn) handleAuthMsg(msg *userAuthRequestMsg, cache *pubKeyCache, p
 	}
 
 	// Some error occurred, or a wrong authentication method was used
-	if p.LimitAuthMethod {
-		err := p.sendFailureMsg("publickey", false)
-		return nil, err
-	}
-
-	err := p.sendFailureMsg(msg.Method, false)
+	err := p.sendFailureMsg(nil, false)
 	return nil, err
 }
 
@@ -300,10 +312,21 @@ func (p *proxyConn) sendOKMsg(algo string, pubkeyData []byte) error {
 	return p.Downstream.transport.writePacket(Marshal(&okMsg))
 }
 
-func (p *proxyConn) sendFailureMsg(method string, partialSuccess bool) error {
+// Send auth failure back to the client.
+// If methods is nil, the accepted methods by the proxy are returned.
+func (p *proxyConn) sendFailureMsg(methods []string, partialSuccess bool) error {
+	if methods == nil {
+		// Auth methods to offer by default
+		methods = []string{"publickey"}
+
+		if p.SecondFactorAsOnlyFactor && p.SecondFactorCallback != nil {
+			methods = append(methods, "keyboard-interactive")
+		}
+	}
+
 	var failureMsg = userAuthFailureMsg{
 		PartialSuccess: partialSuccess,
-		Methods:        []string{method},
+		Methods:        methods,
 	}
 
 	return p.Downstream.transport.writePacket(Marshal(&failureMsg))
@@ -475,7 +498,7 @@ func (p *proxyConn) checkBridgeAuthWithNoBanner(packet []byte) (bool, error) {
 
 		// If LimitAuthMethod is set, do not expose the methods of the backend
 		if msgType == msgUserAuthFailure && p.LimitAuthMethod {
-			err := p.sendFailureMsg("publickey", false)
+			err := p.sendFailureMsg(nil, false)
 			return false, err
 		}
 
